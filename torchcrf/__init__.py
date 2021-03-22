@@ -389,7 +389,7 @@ class CRF(nn.Module):
         beta = self._compute_log_alpha(emissions, mask, run_backwards=True)
         z = torch.logsumexp(alpha[alpha.size(0)-1] + self.end_transitions, dim=1)
         prob = alpha + beta - z.view(1, -1, 1)
-        return torch.exp(prob)
+        return prob
 
 
     @staticmethod
