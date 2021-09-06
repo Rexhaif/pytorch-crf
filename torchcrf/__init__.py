@@ -385,6 +385,10 @@ class CRF(nn.Module):
     def compute_marginal_probabilities(self,
                                        emissions: torch.FloatTensor,
                                        mask: torch.ByteTensor) -> torch.FloatTensor:
+        if self.batch_first:
+            emissions = emissions.transpose(0, 1)
+            mask = mask.transpose(0, 1)
+            
         alpha = self._compute_log_alpha(emissions, mask, run_backwards=False)
         beta = self._compute_log_alpha(emissions, mask, run_backwards=True)
         z = torch.logsumexp(alpha[alpha.size(0)-1] + self.end_transitions, dim=1)
