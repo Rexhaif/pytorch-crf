@@ -6,6 +6,27 @@ import torch
 import torch.nn as nn
 
 
+def logsumexp(tensor: torch.Tensor, dim: int = -1, keepdim: bool = False) -> torch.Tensor:
+    """
+    A numerically stable computation of logsumexp. This is mathematically equivalent to
+    `tensor.exp().sum(dim, keep=keepdim).log()`.  This function is typically used for summing log
+    probabilities.
+    # Parameters
+    tensor : `torch.FloatTensor`, required.
+        A tensor of arbitrary size.
+    dim : `int`, optional (default = `-1`)
+        The dimension of the tensor to apply the logsumexp to.
+    keepdim: `bool`, optional (default = `False`)
+        Whether to retain a dimension of size one at the dimension we reduce over.
+    """
+    max_score, _ = tensor.max(dim, keepdim=keepdim)
+    if keepdim:
+        stable_vec = tensor - max_score
+    else:
+        stable_vec = tensor - max_score.unsqueeze(dim)
+    return max_score + (stable_vec.exp().sum(dim, keepdim=keepdim)).log()
+
+
 class CRF(nn.Module):
     """Conditional random field.
 
@@ -47,15 +68,10 @@ class CRF(nn.Module):
 
         self.reset_parameters()
 
-    def reset_parameters(self) -> None:
-        """Initialize the transition parameters.
-
-        The parameters will be initialized randomly from a uniform distribution
-        between -0.1 and 0.1.
-        """
-        nn.init.uniform_(self.start_transitions, -0.1, 0.1)
-        nn.init.uniform_(self.end_transitions, -0.1, 0.1)
-        nn.init.uniform_(self.transitions, -0.1, 0.1)
+    def reset_parameters(self):
+        torch.nn.init.xavier_normal_(self.transitions)
+        torch.nn.init.normal_(self.start_transitions)
+        torch.nn.init.normal_(self.end_transitions)
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(num_tags={self.num_tags})'
@@ -64,8 +80,7 @@ class CRF(nn.Module):
             self,
             emissions: torch.Tensor,
             tags: torch.LongTensor,
-            mask: Optional[torch.ByteTensor] = None,
-            reduction: str = 'sum',
+            mask: Optional[torch.BoolTensor] = None,
     ) -> torch.Tensor:
         """Compute the conditional log likelihood of a sequence of tags given emission scores.
 
@@ -78,20 +93,17 @@ class CRF(nn.Module):
                 ``(batch_size, seq_length)`` otherwise.
             mask (`~torch.ByteTensor`): Mask tensor of size ``(seq_length, batch_size)``
                 if ``batch_first`` is ``False``, ``(batch_size, seq_length)`` otherwise.
-            reduction: Specifies  the reduction to apply to the output:
-                ``none|sum|mean|token_mean``. ``none``: no reduction will be applied.
-                ``sum``: the output will be summed over batches. ``mean``: the output will be
-                averaged over batches. ``token_mean``: the output will be averaged over tokens.
-
+            
         Returns:
             `~torch.Tensor`: The log likelihood. This will have size ``(batch_size,)`` if
             reduction is ``none``, ``()`` otherwise.
         """
-        self._validate(emissions, tags=tags, mask=mask)
-        if reduction not in ('none', 'sum', 'mean', 'token_mean'):
-            raise ValueError(f'invalid reduction: {reduction}')
+
         if mask is None:
-            mask = torch.ones_like(tags, dtype=torch.uint8)
+            mask = torch.ones(*tags.size(), dtype=torch.bool, device=inputs.device)
+        else:
+            # The code below fails in weird ways if this isn't a bool tensor, so we make sure.
+            mask = mask.to(torch.bool)
 
         if self.batch_first:
             emissions = emissions.transpose(0, 1)
@@ -99,21 +111,12 @@ class CRF(nn.Module):
             mask = mask.transpose(0, 1)
 
         # shape: (batch_size,)
-        numerator = self._compute_score(emissions, tags, mask)
+        numerator = self._joint_likelihood(emissions, tags, mask)
         # shape: (batch_size,)
         denominator = self._compute_normalizer(emissions, mask)
         # shape: (batch_size,)
-        llh = numerator - denominator
-
-        if reduction == 'none':
-            return llh
-        if reduction == 'sum':
-            return llh.sum()
-        if reduction == 'mean':
-            return llh.mean()
-        assert reduction == 'token_mean'
-        return llh.sum() / mask.float().sum()
-
+        return torch.sum(numerator - denominator)
+        
     def decode(self, emissions: torch.Tensor,
                mask: Optional[torch.ByteTensor] = None) -> List[List[int]]:
         """Find the most likely tag sequence using Viterbi algorithm.
@@ -138,132 +141,92 @@ class CRF(nn.Module):
 
         return self._viterbi_decode(emissions, mask)
 
-    def _validate(
-            self,
-            emissions: torch.Tensor,
-            tags: Optional[torch.LongTensor] = None,
-            mask: Optional[torch.ByteTensor] = None) -> None:
-        if emissions.dim() != 3:
-            raise ValueError(f'emissions must have dimension of 3, got {emissions.dim()}')
-        if emissions.size(2) != self.num_tags:
-            raise ValueError(
-                f'expected last dimension of emissions is {self.num_tags}, '
-                f'got {emissions.size(2)}')
-
-        if tags is not None:
-            if emissions.shape[:2] != tags.shape:
-                raise ValueError(
-                    'the first two dimensions of emissions and tags must match, '
-                    f'got {tuple(emissions.shape[:2])} and {tuple(tags.shape)}')
-
-        if mask is not None:
-            if emissions.shape[:2] != mask.shape:
-                raise ValueError(
-                    'the first two dimensions of emissions and mask must match, '
-                    f'got {tuple(emissions.shape[:2])} and {tuple(mask.shape)}')
-            no_empty_seq = not self.batch_first and mask[0].all()
-            no_empty_seq_bf = self.batch_first and mask[:, 0].all()
-            if not no_empty_seq and not no_empty_seq_bf:
-                raise ValueError('mask of the first timestep must all be on')
-
-    def _compute_score(
-            self, emissions: torch.Tensor, tags: torch.LongTensor,
+    def _joint_likelihood(
+            self, logits: torch.Tensor, tags: torch.LongTensor,
             mask: torch.ByteTensor) -> torch.Tensor:
-        # emissions: (seq_length, batch_size, num_tags)
+        # logits: (seq_length, batch_size, num_tags)
         # tags: (seq_length, batch_size)
         # mask: (seq_length, batch_size)
-        assert emissions.dim() == 3 and tags.dim() == 2
-        assert emissions.shape[:2] == tags.shape
-        assert emissions.size(2) == self.num_tags
-        assert mask.shape == tags.shape
-        assert mask[0].any()
-
+        
         seq_length, batch_size = tags.shape
         mask = mask.float()
 
-        # Start transition score and first emission
-        # shape: (batch_size,)
-        score = self.start_transitions[tags[0]]
-        score += emissions[0, torch.arange(batch_size), tags[0]]
+        # Start with the transition scores from start_tag to the first tag in each input
+        score = self.start_transitions.index_select(0, tags[0])
 
-        for i in range(1, seq_length):
-            # Transition score to next tag, only added if next timestep is valid (mask == 1)
-            # shape: (batch_size,)
-            score += self.transitions[tags[i - 1], tags[i]] * mask[i]
 
-            # Emission score for next tag, only added if next timestep is valid (mask == 1)
-            # shape: (batch_size,)
-            score += emissions[i, torch.arange(batch_size), tags[i]] * mask[i]
+        # Add up the scores for the observed transitions and all the inputs but the last
+        for i in range(sequence_length - 1):
+            # Each is shape (batch_size,)
+            current_tag, next_tag = tags[i], tags[i + 1]
 
-        # End transition score
-        # shape: (batch_size,)
-        seq_ends = mask.long().sum(dim=0) - 1
-        # shape: (batch_size,)
-        last_tags = tags[seq_ends, torch.arange(batch_size)]
-        # shape: (batch_size,)
-        score += self.end_transitions[last_tags]
+            # The scores for transitioning from current_tag to next_tag
+            transition_score = self.transitions[current_tag.view(-1), next_tag.view(-1)]
+
+            # The score for using current_tag
+            emit_score = logits[i].gather(1, current_tag.view(batch_size, 1)).squeeze(1)
+
+            # Include transition score if next element is unmasked,
+            # input_score if this element is unmasked.
+            score = score + transition_score * mask[i + 1] + emit_score * mask[i]
+
+        # Transition from last state to "stop" state. To start with, we need to find the last tag
+        # for each instance.
+        last_tag_index = mask.sum(0).long() - 1
+        last_tags = tags.gather(0, last_tag_index.view(1, batch_size)).squeeze(0)
+
+        # Compute score of transitioning to `stop_tag` from each "last tag".
+        last_transition_score = self.end_transitions.index_select(0, last_tags)
+
+        # Add the last input if it's not masked.
+        last_inputs = logits[-1]  # (batch_size, num_tags)
+        last_input_score = last_inputs.gather(1, last_tags.view(-1, 1))  # (batch_size, 1)
+        last_input_score = last_input_score.squeeze()  # (batch_size,)
+
+        score = score + last_transition_score + last_input_score * mask[-1]
 
         return score
 
-    def _compute_normalizer(
-            self, emissions: torch.Tensor, mask: torch.ByteTensor) -> torch.Tensor:
-        # emissions: (seq_length, batch_size, num_tags)
+    def _input_likelihood(
+            self, logits: torch.Tensor, mask: torch.ByteTensor) -> torch.Tensor:
+        # logits: (seq_length, batch_size, num_tags)
         # mask: (seq_length, batch_size)
-        assert emissions.dim() == 3 and mask.dim() == 2
-        assert emissions.shape[:2] == mask.shape
-        assert emissions.size(2) == self.num_tags
-        assert mask[0].any()
+        
+        # Initial alpha is the (batch_size, num_tags) tensor of likelihoods combining the
+        # transitions to the initial states and the logits for the first timestep.
+        alpha = self.start_transitions.view(1, num_tags) + logits[0]
 
-        seq_length = emissions.size(0)
+        # For each i we compute logits for the transitions from timestep i-1 to timestep i.
+        # We do so in a (batch_size, num_tags, num_tags) tensor where the axes are
+        # (instance, current_tag, next_tag)
+        for i in range(1, sequence_length):
+            # The emit scores are for time i ("next_tag") so we broadcast along the current_tag axis.
+            emit_scores = logits[i].view(batch_size, 1, num_tags)
+            # Transition scores are (current_tag, next_tag) so we broadcast along the instance axis.
+            transition_scores = self.transitions.view(1, num_tags, num_tags)
+            # Alpha is for the current_tag, so we broadcast along the next_tag axis.
+            broadcast_alpha = alpha.view(batch_size, num_tags, 1)
 
-        # Start transition score and first emission; score has size of
-        # (batch_size, num_tags) where for each batch, the j-th column stores
-        # the score that the first timestep has tag j
-        # shape: (batch_size, num_tags)
-        score = self.start_transitions + emissions[0]
+            # Add all the scores together and logexp over the current_tag axis.
+            inner = broadcast_alpha + emit_scores + transition_scores
 
-        for i in range(1, seq_length):
-            # Broadcast score for every possible next tag
-            # shape: (batch_size, num_tags, 1)
-            broadcast_score = score.unsqueeze(2)
+            # In valid positions (mask == True) we want to take the logsumexp over the current_tag dimension
+            # of `inner`. Otherwise (mask == False) we want to retain the previous alpha.
+            alpha = util.logsumexp(inner, 1) * mask[i].view(batch_size, 1) + alpha * (
+                ~mask[i]
+            ).view(batch_size, 1)
 
-            # Broadcast emission score for every possible current tag
-            # shape: (batch_size, 1, num_tags)
-            broadcast_emissions = emissions[i].unsqueeze(1)
+        # Every sequence needs to end with a transition to the stop_tag.
+        stops = alpha + self.end_transitions.view(1, num_tags)
+        
 
-            # Compute the score tensor of size (batch_size, num_tags, num_tags) where
-            # for each sample, entry at row i and column j stores the sum of scores of all
-            # possible tag sequences so far that end with transitioning from tag i to tag j
-            # and emitting
-            # shape: (batch_size, num_tags, num_tags)
-            next_score = broadcast_score + self.transitions + broadcast_emissions
-
-            # Sum over all possible current tags, but we're in score space, so a sum
-            # becomes a log-sum-exp: for each sample, entry i stores the sum of scores of
-            # all possible tag sequences so far, that end in tag i
-            # shape: (batch_size, num_tags)
-            next_score = torch.logsumexp(next_score, dim=1)
-
-            # Set score to the next score if this timestep is valid (mask == 1)
-            # shape: (batch_size, num_tags)
-            score = torch.where(mask[i].unsqueeze(1), next_score, score)
-
-        # End transition score
-        # shape: (batch_size, num_tags)
-        score += self.end_transitions
-
-        # Sum (log-sum-exp) over all possible tags
-        # shape: (batch_size,)
-        return torch.logsumexp(score, dim=1)
+        # Finally we log_sum_exp along the num_tags dim, result is (batch_size,)
+        return logsumexp(stops)
 
     def _viterbi_decode(self, emissions: torch.FloatTensor,
                         mask: torch.ByteTensor) -> List[List[int]]:
         # emissions: (seq_length, batch_size, num_tags)
         # mask: (seq_length, batch_size)
-        assert emissions.dim() == 3 and mask.dim() == 2
-        assert emissions.shape[:2] == mask.shape
-        assert emissions.size(2) == self.num_tags
-        assert mask[0].any()
 
         seq_length, batch_size = mask.shape
 
@@ -339,10 +302,6 @@ class CRF(nn.Module):
                            run_backwards: bool) -> torch.FloatTensor:
         # emissions: (seq_length, batch_size, num_tags)
         # mask: (seq_length, batch_size)
-        assert emissions.dim() == 3 and mask.dim() == 2
-        assert emissions.size()[:2] == mask.size()
-        assert emissions.size(2) == self.num_tags
-        assert any(mask[0].data)
 
         seq_length = emissions.size(0)
         mask = mask.float()
