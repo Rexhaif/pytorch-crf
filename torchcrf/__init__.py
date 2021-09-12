@@ -156,7 +156,7 @@ class CRF(nn.Module):
 
 
         # Add up the scores for the observed transitions and all the inputs but the last
-        for i in range(sequence_length - 1):
+        for i in range(seq_length - 1):
             # Each is shape (batch_size,)
             current_tag, next_tag = tags[i], tags[i + 1]
 
@@ -191,6 +191,7 @@ class CRF(nn.Module):
             self, logits: torch.Tensor, mask: torch.ByteTensor) -> torch.Tensor:
         # logits: (seq_length, batch_size, num_tags)
         # mask: (seq_length, batch_size)
+        sequence_length, batch_size, num_tags = logits.size()
         
         # Initial alpha is the (batch_size, num_tags) tensor of likelihoods combining the
         # transitions to the initial states and the logits for the first timestep.
