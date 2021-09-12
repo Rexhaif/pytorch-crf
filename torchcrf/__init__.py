@@ -213,7 +213,7 @@ class CRF(nn.Module):
 
             # In valid positions (mask == True) we want to take the logsumexp over the current_tag dimension
             # of `inner`. Otherwise (mask == False) we want to retain the previous alpha.
-            alpha = util.logsumexp(inner, 1) * mask[i].view(batch_size, 1) + alpha * (
+            alpha = logsumexp(inner, 1) * mask[i].view(batch_size, 1) + alpha * (
                 ~mask[i]
             ).view(batch_size, 1)
 
