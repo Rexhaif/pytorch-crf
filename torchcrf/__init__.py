@@ -113,7 +113,7 @@ class CRF(nn.Module):
         # shape: (batch_size,)
         numerator = self._joint_likelihood(emissions, tags, mask)
         # shape: (batch_size,)
-        denominator = self._compute_normalizer(emissions, mask)
+        denominator = self._input_likelihood(emissions, mask)
         # shape: (batch_size,)
         return torch.sum(numerator - denominator)
         
